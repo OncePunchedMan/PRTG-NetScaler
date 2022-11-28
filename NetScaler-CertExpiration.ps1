@@ -7,12 +7,13 @@ Param(
 $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
 $Credential = New-Object System.Management.Automation.PSCredential ($Username, $SecurePassword)
 
-$Session =  Connect-Netscaler -Hostname $Nsip -Credential $Credential -PassThru
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+$AllProtocols = [System.Net.SecurityProtocolType]'Tls11,Tls12'
+[System.Net.ServicePointManager]::SecurityProtocol = $AllProtocols
 
-$CertResults = Get-NSSSLCertificate -session $Session | Where-Object {$_.certificatetype -contains "CLIENTANDSERVER_CERT"}
-If ($CertResults.count -eq 0) {
-	$CertResults = Get-NSSSLCertificate -session $Session | Where-Object {$_.certificatetype -contains "SRVR_CERT"} 
-}
+$Session =  Connect-Netscaler -Hostname $Nsip -Credential $Credential -PassThru -Https:$true
+
+$CertResults = Get-NSSSLCertificate -session $Session | Where-Object {$_.certificatetype -contains "CLNT_CERT" -or "SRVR_CERT" -or "INTM_CERT"}
 
 $FirstExpiration = 2000
 foreach ($Result in $CertResults) {
