@@ -1,93 +1,100 @@
 Param(
-	[string]$Nsip,
-	[string]$Username,
-	[string]$Password
+    [string]$Nsip,
+    [string]$Username,
+    [string]$Password
 )
-    
-$SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-$Credential = New-Object System.Management.Automation.PSCredential ($Username, $SecurePassword)
 
-$Session =  Connect-Netscaler -Hostname $Nsip -Credential $Credential -PassThru
+$ErrorActionPreference      = 'Stop'
+$WarningPreference          = 'SilentlyContinue'
+$VerbosePreference          = 'SilentlyContinue'
+$InformationPreference      = 'SilentlyContinue'
+$ProgressPreference         = 'SilentlyContinue'
 
-$CertResults = Get-NSSSLCertificate -session $Session | Where-Object {$_.certificatetype -eq "CLIENTANDSERVER_CERT"} 
-
-$ResultSSL = Get-NSStat -session $Session -Type 'ssl'
-$ResultSystem = Get-NSStat -session $Session -Type 'system'
-$ResultInterface = Get-NSStat -session $Session -Type 'interface'
-
-Write-Host "<prtg>"
-
-Write-Host "<result>"
-Write-Host ("<channel>CPU Usage</channel>")
-Write-Host ("<value>" + [math]::Round($ResultSystem.cpuusagepcnt) + "</value>")
-Write-Host "<unit>Percent</unit>"
-Write-Host "</result>"
-
-Write-Host "<result>"
-Write-Host ("<channel>Packet CPU Usage</channel>")
-Write-Host ("<value>" + [math]::Round($ResultSystem.pktcpuusagepcnt) + "</value>")
-Write-Host "<unit>Percent</unit>"
-Write-Host "</result>"
-
-Write-Host "<result>"
-Write-Host ("<channel>Management CPU Usage</channel>")
-Write-Host ("<value>" + [math]::Round($ResultSystem.mgmtcpuusagepcnt) + "</value>")
-Write-Host "<unit>Percent</unit>"
-Write-Host "</result>"
-
-Write-Host "<result>"
-Write-Host ("<channel>Memory Usage</channel>")
-Write-Host ("<value>" + [math]::Round($ResultSystem.memusagepcnt) + "</value>")
-Write-Host "<unit>Percent</unit>"
-Write-Host "</result>"
-
-Write-Host "<result>"
-Write-Host ("<channel>Memory MB Usage</channel>")
-Write-Host ("<value>" + (([int]$ResultSystem.memuseinmb)*1024)*1024 + "</value>")
-Write-Host "<unit>BytesMemory</unit>"
-Write-Host "</result>"
-
-Write-Host "<result>"
-Write-Host ("<channel>Disk 0 Usage</channel>")
-Write-Host ("<value>" + [math]::truncate(($ResultSystem.disk0used/$ResultSystem.disk0size)*100) + "</value>")
-Write-Host "<unit>Percent</unit>"
-Write-Host "</result>"
-
-Write-Host "<result>"
-Write-Host ("<channel>Disk 1 Usage</channel>")
-Write-Host ("<value>" + [math]::truncate(($ResultSystem.disk1used/$ResultSystem.disk1size)*100) + "</value>")
-Write-Host "<unit>Percent</unit>"
-Write-Host "</result>"
-
-Write-Host "<result>"
-Write-Host ("<channel>SSL Transactions/sec</channel>")
-Write-Host ("<value>" + $ResultSSL.ssltransactionsrate + "</value>")
-Write-Host "<unit>Custom</unit>"
-Write-Host "<CustomUnit>Transactions</CustomUnit>"
-Write-Host "</result>"
-
-$rxbytesratetotal = 0
-$txbytesratetotal = 0
-
-foreach ($Result in $ResultInterface) {
-	$rxbytesratetotal = $rxbytesratetotal + $Result.rxbytesrate
-	$txbytesratetotal = $txbytesratetotal + $Result.txbytesrate
+function Escape-Xml([string]$s) {
+    if ($null -eq $s) { return "" }
+    return ($s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;' -replace "'","&apos;")
 }
 
-Write-Host "<result>"
-Write-Host ("<channel>RX Bandwidth</channel>")
-Write-Host ("<value>" + $rxbytesratetotal + "</value>")
-Write-Host "<unit>BytesBandwidth</unit>"
-Write-Host "<SpeedSize>KiloBits</SpeedSize>"
-Write-Host "</result>"
+# Disable SSL certificate validation
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]'Tls11,Tls12'
 
-Write-Host "<result>"
-Write-Host ("<channel>TX Bandwidth</channel>")
-Write-Host ("<value>" + $txbytesratetotal + "</value>")
-Write-Host "<unit>BytesBandwidth</unit>"
-Write-Host "<SpeedSize>KiloBits</SpeedSize>"
-Write-Host "</result>"
+$SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+$Credential     = New-Object System.Management.Automation.PSCredential ($Username, $SecurePassword)
 
-Write-Host "</prtg>"
+$Session = $null
+$xmlOut  = $null
 
-Disconnect-Netscaler
+try {
+    $Session = Connect-Netscaler -Hostname $Nsip -Credential $Credential -PassThru -Https:$true -ErrorAction Stop
+
+    $ResultSSL       = Get-NSStat -Session $Session -Type 'ssl'      -ErrorAction Stop
+    $ResultSystem    = Get-NSStat -Session $Session -Type 'system'   -ErrorAction Stop
+    $ResultInterface = Get-NSStat -Session $Session -Type 'interface'-ErrorAction Stop
+
+    # Disconnect BEFORE output to avoid junk after </prtg>
+    try { Disconnect-Netscaler -Session $Session -Force -ErrorAction SilentlyContinue | Out-Null } catch {}
+    $Session = $null
+
+    # Helpers for safe math
+    function Safe-Percent([double]$used, [double]$size) {
+        if (-not $size -or $size -le 0) { return 0 }
+        return [math]::Truncate(($used / $size) * 100)
+    }
+
+    # RX/TX totals
+    $rxbytesratetotal = 0
+    $txbytesratetotal = 0
+    foreach ($i in $ResultInterface) {
+        $rxbytesratetotal += [double]$i.rxbytesrate
+        $txbytesratetotal += [double]$i.txbytesrate
+    }
+
+    $cpu     = [math]::Round([double]$ResultSystem.cpuusagepcnt)
+    $pktcpu  = [math]::Round([double]$ResultSystem.pktcpuusagepcnt)
+    $mgmtcpu = [math]::Round([double]$ResultSystem.mgmtcpuusagepcnt)
+    $mem     = [math]::Round([double]$ResultSystem.memusagepcnt)
+
+    # memuseinmb -> BytesMemory (PRTG expects bytes)
+    $memBytes = ([int64]$ResultSystem.memuseinmb) * 1024 * 1024
+
+    $disk0 = Safe-Percent ([double]$ResultSystem.disk0used) ([double]$ResultSystem.disk0size)
+    $disk1 = Safe-Percent ([double]$ResultSystem.disk1used) ([double]$ResultSystem.disk1size)
+
+    $sslRate = [double]$ResultSSL.ssltransactionsrate
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("<prtg>")
+
+    [void]$sb.AppendLine("  <result><channel>CPU Usage</channel><value>$cpu</value><unit>Percent</unit></result>")
+    [void]$sb.AppendLine("  <result><channel>Packet CPU Usage</channel><value>$pktcpu</value><unit>Percent</unit></result>")
+    [void]$sb.AppendLine("  <result><channel>Management CPU Usage</channel><value>$mgmtcpu</value><unit>Percent</unit></result>")
+    [void]$sb.AppendLine("  <result><channel>Memory Usage</channel><value>$mem</value><unit>Percent</unit></result>")
+
+    [void]$sb.AppendLine("  <result><channel>Memory MB Usage</channel><value>$memBytes</value><unit>BytesMemory</unit></result>")
+
+    [void]$sb.AppendLine("  <result><channel>Disk 0 Usage</channel><value>$disk0</value><unit>Percent</unit></result>")
+    [void]$sb.AppendLine("  <result><channel>Disk 1 Usage</channel><value>$disk1</value><unit>Percent</unit></result>")
+
+    [void]$sb.AppendLine("  <result><channel>SSL Transactions/sec</channel><value>$sslRate</value><unit>Custom</unit><CustomUnit>Transactions</CustomUnit></result>")
+
+    [void]$sb.AppendLine("  <result><channel>RX Bandwidth</channel><value>$rxbytesratetotal</value><unit>BytesBandwidth</unit><SpeedSize>KiloBits</SpeedSize></result>")
+    [void]$sb.AppendLine("  <result><channel>TX Bandwidth</channel><value>$txbytesratetotal</value><unit>BytesBandwidth</unit><SpeedSize>KiloBits</SpeedSize></result>")
+
+    [void]$sb.AppendLine("  <error>0</error>")
+    [void]$sb.AppendLine("  <text>System/SSL/Interface stats OK</text>")
+    [void]$sb.AppendLine("</prtg>")
+
+    $xmlOut = $sb.ToString()
+}
+catch {
+    $msg = Escape-Xml $_.Exception.Message
+    $xmlOut = "<prtg><error>1</error><text>NetScaler stats check failed: $msg</text></prtg>"
+}
+finally {
+    try {
+        if ($Session) { Disconnect-Netscaler -Session $Session -Force -ErrorAction SilentlyContinue | Out-Null }
+    } catch {}
+}
+
+Write-Output $xmlOut
